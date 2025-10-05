@@ -1,4 +1,4 @@
-// main.c - Menu de acesso + GPIO + usuários em um único arquivo.
+// main.c
 // Compile: gcc -O2 -Wall -o acesso main.c -lcrypt
 // Rode   : sudo ./acesso
 
@@ -17,6 +17,15 @@
 #include <crypt.h>
 #include <termios.h>
 #include <limits.h>
+#include <sys/ioctl.h>
+
+// -------------------- Configuração de Serial(UART) --------------------
+#ifndef SERIAL_DEV
+#define SERIAL_DEV "/dev/serial0"
+#endif
+#ifndef SERIAL_BAUD
+#define SERIAL_BAUD B115200
+#endif
 
 // -------------------- Configuração de GPIO (BCM) --------------------
 #define DOOR1_BCM 17
@@ -37,7 +46,7 @@ typedef enum { ROLE_USER = 0, ROLE_ADMIN = 1 } Role;
 typedef struct {
     char name[64];
     Role role;
-    char hash[128]; // crypt $6$... (SHA-512)
+    char hash[128];
 } User;
 
 #define MAX_USERS 256
@@ -79,7 +88,6 @@ static int append_line(const char *path, const char *line) {
 }
 
 static int ensure_dir(const char *p) {
-    // cria diretório pai do caminho, se necessário
     char tmp[256]; strncpy(tmp, p, sizeof tmp - 1);
     char *slash = strrchr(tmp, '/');
     if (!slash) return 0;
@@ -131,7 +139,6 @@ static int detect_sysfs_base(void) {
         int ngpio = read_int_file(p_ngpio);
         if (base < 0 || ngpio < 0) continue;
 
-        // chip "principal" do Pi costuma ter >=54 linhas
         if (ngpio >= 54 && ngpio > best_ngpio) {
             best_ngpio = ngpio;
             best_base  = base;
@@ -219,7 +226,6 @@ static int prompt_password(const char *msg, char *out, size_t n, int confirm){
     bool have_tty = isatty(STDIN_FILENO);
     int echo_disabled = 0;
 
-    // mostra o prompt no stderr (menos bufferizado)
     fprintf(stderr, "%s", msg);
     fflush(stderr);
 
@@ -234,13 +240,12 @@ static int prompt_password(const char *msg, char *out, size_t n, int confirm){
     if (!fgets(out, (int)n, stdin)) {
         out[0] = 0;
     } else {
-        // tira \n e espaços
         size_t L = strlen(out);
         while (L && (out[L-1]=='\n' || out[L-1]=='\r' || out[L-1]==' ' || out[L-1]=='\t')) out[--L] = 0;
     }
 
     if (echo_disabled) tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
-    fprintf(stderr, "\n"); // quebra linha após a senha
+    fprintf(stderr, "\n");
 
     if (confirm) {
         char again[128] = {0};
@@ -294,7 +299,7 @@ static int find_user(const char *name){
 
 static int gen_salt(char *out, size_t n){
     static const char tbl[]="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789./";
-    if(n<4+1+16+1) return -1; // "$6$" + salt + "$"
+    if(n<4+1+16+1) return -1;
     unsigned char buf[16];
     int fd = open("/dev/urandom", O_RDONLY);
     if(fd<0 || read(fd,buf,sizeof buf)!=sizeof buf){ if(fd>=0) close(fd); return -1; }
@@ -365,7 +370,6 @@ static int users_init(const char *path){
     const char *use = (path && *path)? path : USERS_DB_DEFAULT;
     strncpy(g_users_db_path, use, sizeof g_users_db_path - 1);
     if(load_users_db(use)<0){
-        // cria vazio
         return save_users_db(use);
     }
     return 0;
@@ -403,7 +407,6 @@ static void event_append(const char *user, int door, const char *action){
         strncpy(g_events[g_evt_n].action, action, sizeof g_events[g_evt_n].action - 1);
         g_evt_n++;
     }
-    // também persiste em arquivo
     char line[256];
     struct tm tm; time_t now = time(NULL); localtime_r(&now,&tm);
     strftime(line, sizeof line, "%Y-%m-%d %H:%M:%S", &tm);
@@ -469,7 +472,7 @@ static void open_door_flow(int door){
     printf(">>> Porta %d ABERTA por %s (role=%s)\n", door, user, role_str(r));
     event_append(user, door, "OPEN");
 
-    // Timeout 5s (por enquanto sem botão)
+    // Timeout 5s
     for(int i=0;i<5;i++){ msleep(1000); }
 
     // Fechar
@@ -556,8 +559,77 @@ static void menu_loop(void){
     }
 }
 
+static int uart_open_configure(const char *dev) {
+    int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
+    if (fd < 0) return -1;
+
+    // limpa O_NONBLOCK para leitura bloqueante depois da config
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+
+    struct termios tio;
+    if (tcgetattr(fd, &tio) != 0) { close(fd); return -1; }
+
+    cfmakeraw(&tio);
+    // 115200 8N1
+    cfsetispeed(&tio, SERIAL_BAUD);
+    cfsetospeed(&tio, SERIAL_BAUD);
+    tio.c_cflag &= ~CSTOPB;     // 1 stop
+    tio.c_cflag &= ~PARENB;     // no parity
+    tio.c_cflag &= ~CRTSCTS;    // sem HW flow control
+    tio.c_cflag |= (CLOCAL | CREAD | CS8);
+
+    tio.c_lflag |= ICANON;
+    tio.c_lflag &= ~(ECHO | ECHONL);
+
+    // Caracteres de controle
+    tio.c_cc[VEOL]  = '\n';
+    tio.c_cc[VEOL2] = '\r';
+
+    if (tcsetattr(fd, TCSANOW, &tio) != 0) { close(fd); return -1; }
+
+    // esvazia buffers
+    tcflush(fd, TCIOFLUSH);
+    return fd;
+}
+
+static int uart_redirect_stdio_if_enabled(int argc, char **argv) {
+    int want_uart = 0;
+
+    // ativa se tiver --uart
+    for (int i=1; i<argc; i++) {
+        if (strcmp(argv[i], "--uart") == 0) { want_uart = 1; break; }
+    }
+    // ou se tiver env UART=1
+    if (!want_uart) {
+        const char *e = getenv("UART");
+        if (e && (!strcmp(e,"1") || !strcasecmp(e,"true") || !strcasecmp(e,"yes"))) want_uart = 1;
+    }
+    if (!want_uart) return 0;
+
+    int fd = uart_open_configure(SERIAL_DEV);
+    if (fd < 0) {
+        fprintf(stderr, "[ERR] Nao foi possivel abrir %s.\n", SERIAL_DEV);
+        return -1;
+    }
+
+    if (dup2(fd, STDIN_FILENO)  < 0) { close(fd); return -1; }
+    if (dup2(fd, STDOUT_FILENO) < 0) { close(fd); return -1; }
+    if (dup2(fd, STDERR_FILENO) < 0) { close(fd); return -1; }
+
+    if (fd > 2) close(fd);
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    fprintf(stdout, "[UART] %s aberto a 115200 8N1.\n", SERIAL_DEV);
+    return 1;
+}
+
 // -------------------- main -------------------------------------------
-int main(void){
+int main(int argc, char **argv){
+
+    int uart_mode = uart_redirect_stdio_if_enabled(argc, argv);
 
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
