@@ -1,6 +1,6 @@
-// main.c
-// Compile: gcc -O2 -Wall -o acesso main.c -lcrypt
-// Rode   : sudo ./acesso
+//Gerenciamento de Acesso - Linux Embarcado
+//Autor: Victor Alves Morais
+//Data: 04/10/2025
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -18,6 +18,7 @@
 #include <termios.h>
 #include <limits.h>
 #include <sys/ioctl.h>
+#include <curl/curl.h>
 
 // -------------------- Configuração de Serial(UART) --------------------
 #ifndef SERIAL_DEV
@@ -39,6 +40,52 @@
 #ifndef EVENTS_LOG_FILE
 #define EVENTS_LOG_FILE  "/var/log/acesso_events.log"
 #endif
+
+// -------------------- HTTP (libcurl) --------------------------------
+#ifndef ACESSO_SERVER_DEFAULT
+#define ACESSO_SERVER_DEFAULT "http://127.0.0.1:8080"
+#endif
+static const char* get_server_base(void){
+    const char *s = getenv("ACESSO_SERVER");
+    return (s && *s) ? s : ACESSO_SERVER_DEFAULT;
+}
+static const char* get_auth_token(void){
+    return getenv("ACESSO_TOKEN"); 
+}
+static int http_post_json(const char *path, const char *json_body){
+    const char *base = get_server_base();
+    char url[512];
+    snprintf(url, sizeof url, "%s%s", base, path);
+
+    CURL *curl = curl_easy_init();
+    if(!curl) return -1;
+
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+
+    const char *tok = get_auth_token();
+    char auth[256];
+    if(tok && *tok){
+        snprintf(auth, sizeof auth, "Authorization: Bearer %s", tok);
+        hdrs = curl_slist_append(hdrs, auth);
+    }
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_body);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
+
+    long code = 0;
+    CURLcode rc = curl_easy_perform(curl);
+    if(rc == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    return (rc == CURLE_OK && code >= 200 && code < 300) ? 0 : -1;
+}
 
 // -------------------- Usuários --------------------------------------
 typedef enum { ROLE_USER = 0, ROLE_ADMIN = 1 } Role;
@@ -426,6 +473,45 @@ static void events_print_all(void){
     }
 }
 
+// -------------------- Modbus RTU helpers ----------------------------
+// CRC-16 Modbus 
+static unsigned short modbus_crc16(const unsigned char *buf, size_t len){
+    unsigned short crc = 0xFFFF;
+    for(size_t i=0;i<len;i++){
+        crc ^= buf[i];
+        for(int b=0;b<8;b++){
+            if(crc & 1) crc = (crc >> 1) ^ 0xA001;
+            else        crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+static int modbus_build_write_coil_frame(int door, int open, char *out_hex, size_t out_hex_size){
+    unsigned char addr = 0x01, func = 0x05;
+    unsigned short coil = (door==1)?0x0034:0x0035;
+    unsigned short val  = open ? 0xFF00 : 0x0000;
+
+    unsigned char frame[8];
+    frame[0]=addr; frame[1]=func;
+    frame[2]=(unsigned char)((coil>>8)&0xFF); frame[3]=(unsigned char)(coil&0xFF);
+    frame[4]=(unsigned char)((val >>8)&0xFF); frame[5]=(unsigned char)(val &0xFF);
+
+    unsigned short crc = modbus_crc16(frame,6);
+    frame[6]=(unsigned char)(crc &0xFF);      // CRC low
+    frame[7]=(unsigned char)((crc>>8)&0xFF);  // CRC high
+
+    if(out_hex_size < 17) return -1; 
+    static const char H[]="0123456789ABCDEF";
+    for(int i=0;i<8;i++){ out_hex[2*i]=H[(frame[i]>>4)&0xF]; out_hex[2*i+1]=H[frame[i]&0xF]; }
+    out_hex[16]='\0';
+    return 0;
+}
+static int http_send_modbus_hex(const char *hex){
+    char j[64]; snprintf(j,sizeof j,"{\"rtu\":\"%s\"}", hex);
+    return http_post_json("/api/modbus", j);
+}
+
 // -------------------- Fluxos de porta --------------------------------
 static int door_global_from_num(int door){
     int bcm = (door==1)?DOOR1_BCM:DOOR2_BCM;
@@ -472,6 +558,12 @@ static void open_door_flow(int door){
     printf(">>> Porta %d ABERTA por %s (role=%s)\n", door, user, role_str(r));
     event_append(user, door, "OPEN");
 
+    char hex_open[32];
+    if (modbus_build_write_coil_frame(door, 1, hex_open, sizeof hex_open) == 0) {
+        if (http_send_modbus_hex(hex_open) != 0)
+            fprintf(stderr,"[WARN] Falha ao enviar RTU OPEN porta %d\n", door);
+    }
+
     // Timeout 5s
     for(int i=0;i<5;i++){ msleep(1000); }
 
@@ -479,6 +571,12 @@ static void open_door_flow(int door){
     gpio_write_global(g,0);
     printf("<<< Porta %d FECHADA (timeout)\n", door);
     event_append(user, door, "CLOSE");
+
+    char hex_close[32];
+    if (modbus_build_write_coil_frame(door, 0, hex_close, sizeof hex_close) == 0) {
+        if (http_send_modbus_hex(hex_close) != 0)
+            fprintf(stderr,"[WARN] Falha ao enviar RTU CLOSE porta %d\n", door);
+    }
 }
 
 // -------------------- Menu -------------------------------------------
@@ -515,9 +613,18 @@ static void menu_loop(void){
                 printf("Senhas nao conferem.\n"); continue;
             }
             int rc = users_add(name, is_admin?ROLE_ADMIN:ROLE_USER, pwd);
-            if(rc==0)       printf("Usuario '%s' criado (%s).\n", name, roleb);
-            else if(rc==-2) printf("Usuario ja existe.\n");
-            else            printf("Falha ao criar usuario.\n");
+            if(rc==0){
+                printf("Usuario '%s' criado (%s).\n", name, roleb);
+
+                char jbuf[512];
+                snprintf(jbuf,sizeof jbuf,"{\"name\":\"%s\",\"role\":\"%s\"}", name, is_admin?"ADMIN":"USER");
+                if (http_post_json("/api/users", jbuf) != 0)
+                    fprintf(stderr,"[WARN] Falha ao enviar usuario para servidor.\n");
+            } else if(rc==-2){
+                printf("Usuario ja existe.\n");
+            } else {
+                printf("Falha ao criar usuario.\n");
+            }
         }
         else if(strcmp(opt,"2")==0){
             // exige admin
@@ -563,7 +670,6 @@ static int uart_open_configure(const char *dev) {
     int fd = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (fd < 0) return -1;
 
-    // limpa O_NONBLOCK para leitura bloqueante depois da config
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
 
@@ -574,21 +680,19 @@ static int uart_open_configure(const char *dev) {
     // 115200 8N1
     cfsetispeed(&tio, SERIAL_BAUD);
     cfsetospeed(&tio, SERIAL_BAUD);
-    tio.c_cflag &= ~CSTOPB;     // 1 stop
-    tio.c_cflag &= ~PARENB;     // no parity
-    tio.c_cflag &= ~CRTSCTS;    // sem HW flow control
+    tio.c_cflag &= ~CSTOPB;
+    tio.c_cflag &= ~PARENB;    
+    tio.c_cflag &= ~CRTSCTS;
     tio.c_cflag |= (CLOCAL | CREAD | CS8);
 
     tio.c_lflag |= ICANON;
     tio.c_lflag &= ~(ECHO | ECHONL);
 
-    // Caracteres de controle
     tio.c_cc[VEOL]  = '\n';
     tio.c_cc[VEOL2] = '\r';
 
     if (tcsetattr(fd, TCSANOW, &tio) != 0) { close(fd); return -1; }
 
-    // esvazia buffers
     tcflush(fd, TCIOFLUSH);
     return fd;
 }
@@ -639,6 +743,8 @@ int main(int argc, char **argv){
         return 1;
     }
 
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     // prepara DB de usuários
     if (users_init(NULL) < 0) {
         fprintf(stderr, "Nao foi possivel inicializar DB de usuarios (%s).\n", USERS_DB_DEFAULT);
@@ -655,12 +761,12 @@ int main(int argc, char **argv){
     // entra no menu
     menu_loop();
 
-    // opcional: deixar pinos em 0 e desexportar ao sair
     int g1 = bcm_to_sysfs(DOOR1_BCM);
     int g2 = bcm_to_sysfs(DOOR2_BCM);
     gpio_write_global(g1,0);
     gpio_write_global(g2,0);
-    // gpio_unexport_global(g1); gpio_unexport_global(g2);
+
+    curl_global_cleanup();
 
     return 0;
 }
