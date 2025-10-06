@@ -12,6 +12,10 @@ Projeto desenvolvido para **Raspberry Pi 4** que implementa um sistema de gerenc
 
 ---
 
+## Hardware 
+
+### Diagrama do Hardware utilizado
+![Diagrama](https://github.com/VictorAMorais/gerenciamento_de_acesso-linux_embarcado/blob/main/Diagrama%20Hardware%20Controle%20de%20Acesso.png)
 
 ## ⚡ Funcionalidades
 
@@ -74,7 +78,7 @@ Porta 1 ABERTA por Victor
   sudo apt-get install build-essential libcurl4-openssl-dev libcrypt-dev jq -y
 
 🔧 Compilação
-git clone https://github.com/<seu_usuario>/gerenciamento_de_acesso-linux_embarcado.git
+git clone https://github.com/VictorAMorais/gerenciamento_de_acesso-linux_embarcado.git
 cd gerenciamento_de_acesso-linux_embarcado
 gcc -O2 -Wall -o acesso main.c -lcrypt -lcurl
 
