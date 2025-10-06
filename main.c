@@ -29,8 +29,11 @@
 #endif
 
 // -------------------- Configuração de GPIO (BCM) --------------------
-#define DOOR1_BCM 17
-#define DOOR2_BCM 27
+#define DOOR1_BCM 17 // Porta 1
+#define DOOR2_BCM 27 // Porta 2
+
+#define BTN1_BCM 22 // Botão 1 
+#define BTN2_BCM 23 // Botão 2 
 
 // -------------------- Arquivos de persistência ----------------------
 #ifndef USERS_DB_DEFAULT
@@ -528,6 +531,20 @@ static void door_init_outputs(void){
     gpio_set_dir_global(g2,"out");
     gpio_write_global(g1,0);
     gpio_write_global(g2,0);
+
+    int b1=bcm_to_sysfs(BTN1_BCM);
+    int b2=bcm_to_sysfs(BTN2_BCM);
+    gpio_export_global(b1); 
+    gpio_set_dir_global(b1,"in");
+    gpio_export_global(b2); 
+    gpio_set_dir_global(b2,"in");
+}
+
+static int button_pressed(int btn_bcm){
+    int g = bcm_to_sysfs(btn_bcm);
+    int v = gpio_read_global(g);
+    // Se você usar resistor pull-up externo, botão pressionado = 0
+    return (v == 0); 
 }
 
 static int auth_prompt(Role *out_role, char *out_user, size_t nuser){
@@ -564,8 +581,15 @@ static void open_door_flow(int door){
             fprintf(stderr,"[WARN] Falha ao enviar RTU OPEN porta %d\n", door);
     }
 
-    // Timeout 5s
-    for(int i=0;i<5;i++){ msleep(1000); }
+    // Espera até 5s ou botão pressionado
+    int btn_bcm = (door==1)?BTN1_BCM:BTN2_BCM;
+    for(int i=0;i<50;i++){
+        if(button_pressed(btn_bcm)){
+            printf("Botao da porta %d pressionado!\n", door);
+            break;
+        }
+        msleep(100);
+    }
 
     // Fechar
     gpio_write_global(g,0);
