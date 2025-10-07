@@ -124,6 +124,7 @@ POST /api/events {
 }
 
 Consultando via curl
+```bash
 curl -s http://127.0.0.1:8080/api/events | jq .
 
 
@@ -143,7 +144,7 @@ Saída:
     "action": "CLOSE"
   }
 ]
-
+```
 🚀 Execução no boot (systemd)
 Serviço do app
 
